@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Energy Dispatch Simulator</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0c0e13;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  #game {
+    background: #121622;
+    max-width: 100%;
+    max-height: 100vh;
+    touch-action: none;
+    border-radius: 8px;
+    box-shadow: 0 0 40px rgba(0,0,0,0.5);
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="1000" height="650"></canvas>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// constants
+// ---------------------------------------------------------------------------
+
+const SCREEN_W = 1000, SCREEN_H = 650;
+
+const NOMINAL_FREQ = 50.0;
+
+// Frequency bands
+const FREQ_GREEN_LO = 49.95, FREQ_GREEN_HI = 50.05;
+const FREQ_RED_LO = 48.0, FREQ_RED_HI = 52.0;
+
+const RED_ZONE_BLACKOUT_SECONDS = 5.0; // continuous time in red before blackout triggers
+const FREQ_RESPONSIVENESS = 0.06;
+
+// clock
+const HOURS_PER_DAY = 24;
+const SECONDS_PER_GAME_HOUR = 3.0;
+const START_HOUR = 6.0;
+
+// Colors
+const COL_BG = "#121e1e".slice ? "#12161e" : "#12161e";
+const COL_PANEL = "#1e2430";
+const COL_PANEL_BORDER = "#373f52";
+const COL_TEXT = "#e6ebf0";
+const COL_SUBTEXT = "#96a0af";
+const COL_GOOD = "#50d278";
+const COL_WARN = "#f0be46";
+const COL_BAD = "#e65050";
+const COL_WIND = "#64bee6";
+const COL_PV = "#f0c83c";
+const COL_GAS = "#d2785a";
+const COL_OFF = "#464c58";
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function rand(lo, hi) { return lo + Math.random() * (hi - lo); }
+
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// ---------------------------------------------------------------------------
+// Weather
+// ---------------------------------------------------------------------------
+
+function createWeather() {
+  return {
+    time: 0.0,
+    windSpeed: 0.6,
+    cloudCover: 0.3,
+    windTarget: 0.6,
+    cloudTarget: 0.3,
+    retargetTimer: 0.0,
+
+    update(dt) {
+      this.time += dt;
+      this.retargetTimer -= dt;
+      if (this.retargetTimer <= 0) {
+        this.windTarget = rand(0.15, 0.95);
+        this.cloudTarget = rand(0.05, 0.9);
+        this.retargetTimer = rand(6, 14);
+      }
+      this.windSpeed = lerp(this.windSpeed, this.windTarget, dt * 0.15);
+      this.cloudCover = lerp(this.cloudCover, this.cloudTarget, dt * 0.15);
+    },
+
+    windPotential() { return clamp(this.windSpeed, 0, 1); },
+
+    solarPotential(hour) {
+      let dayPhase = 0.0;
+      if (hour >= 6 && hour <= 20) {
+        dayPhase = clamp(Math.sin((hour - 6) / 14 * Math.PI), 0, 1);
+      }
+      return clamp(dayPhase * (1 - 0.8 * this.cloudCover), 0, 1);
+    },
+
+    forecastText() {
+      const windDesc = this.windSpeed < 0.3 ? "calm" : this.windSpeed < 0.65 ? "breezy" : "windy";
+      const cloudDesc = this.cloudCover < 0.3 ? "Clear" : this.cloudCover < 0.65 ? "Partly cloudy" : "Overcast";
+      return `${cloudDesc}, ${windDesc}`;
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Clock
+// ---------------------------------------------------------------------------
+
+function createClock() {
+  return {
+    hour: START_HOUR,
+    update(dt) {
+      this.hour = (this.hour + dt / SECONDS_PER_GAME_HOUR) % HOURS_PER_DAY;
+    },
+    displayHour() { return Math.floor(this.hour) % HOURS_PER_DAY; },
+    displayText() { return `${this.displayHour()}:00`; }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Demand
+// ---------------------------------------------------------------------------
+
+function hourDist(h, target) {
+  const d = Math.abs(h - target);
+  return Math.min(d, HOURS_PER_DAY - d);
+}
+
+function createDemand(baseMw = 150) {
+  return {
+    baseMw,
+    noise: 0.0,
+    update(dt) {
+      this.noise = lerp(this.noise, rand(-1, 1), dt * 0.5);
+    },
+    currentMw(hour) {
+      const nightDip = 40 * Math.exp(-(hourDist(hour, 3.5) ** 2) / (2 * 2.5 ** 2));
+      const morningRamp = 55 * Math.exp(-(hourDist(hour, 9) ** 2) / (2 * 2.2 ** 2));
+      const eveningPeak = 110 * Math.exp(-(hourDist(hour, 19.5) ** 2) / (2 * 2.5 ** 2));
+      const jitter = this.noise * 12;
+      return Math.max(40, this.baseMw + morningRamp + eveningPeak - nightDip + jitter);
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Power plant panel
+// ---------------------------------------------------------------------------
+
+class Plant {
+  constructor(name, rect, color, capacityMw, controllable, rampRate) {
+    this.name = name;
+    this.rect = rect; // {x, y, w, h}
+    this.color = color;
+    this.capacityMw = capacityMw;
+    this.controllable = controllable;
+    this.rampRate = rampRate;
+
+    this.on = true;
+    this.setpoint = 0.5;
+    this.output = 0.0;
+
+    this.buttonRect = { x: rect.x + 14, y: rect.y + rect.h - 42, w: 90, h: 28 };
+  }
+
+  potentialCeiling(weather, hour) { return 1.0; }
+
+  containsPoint(p) {
+    return p.x >= this.rect.x && p.x <= this.rect.x + this.rect.w &&
+           p.y >= this.rect.y && p.y <= this.rect.y + this.rect.h;
+  }
+
+  buttonContainsPoint(p) {
+    const b = this.buttonRect;
+    return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+  }
+
+  handleScroll(pos, direction) {
+    if (this.containsPoint(pos)) {
+      this.setpoint = clamp(this.setpoint + direction * 0.05, 0.0, 1.0);
+      return true;
+    }
+    return false;
+  }
+
+  handleClick(pos) {
+    if (this.buttonContainsPoint(pos)) {
+      this.on = !this.on;
+      return true;
+    }
+    return false;
+  }
+
+  update(dt, weather, hour) {
+    const ceiling = this.potentialCeiling(weather, hour);
+    const target = this.on ? Math.min(this.setpoint, ceiling) : 0.0;
+    this.output = lerp(this.output, target, clamp(dt * this.rampRate, 0, 1));
+  }
+
+  outputMw() { return this.output * this.capacityMw; }
+
+  draw(ctx, font, smallFont, weather, hour) {
+    const r = this.rect;
+
+    roundRect(ctx, r.x, r.y, r.w, r.h, 10);
+    ctx.fillStyle = COL_PANEL;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = COL_PANEL_BORDER;
+    ctx.stroke();
+
+    ctx.fillStyle = COL_TEXT;
+    ctx.font = font;
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    ctx.fillText(this.name, r.x + 14, r.y + 12);
+
+    // Vertical output bar
+    const barX = r.x + 14;
+    const barY = r.y + 46;
+    const barW = 26;
+    const barH = r.h - 110;
+
+    ctx.fillStyle = "#0c0f14";
+    roundRect(ctx, barX, barY, barW, barH, 4);
+    ctx.fill();
+
+    const fillH = barH * this.output;
+    ctx.fillStyle = this.on ? this.color : COL_OFF;
+    roundRect(ctx, barX, barY + (barH - fillH), barW, Math.max(0, fillH), 4);
+    ctx.fill();
+
+    // Curtailment overlay
+    const ceiling = this.potentialCeiling(weather, hour);
+    const curtailed = ceiling - this.setpoint;
+    if (curtailed > 0.005) {
+      const overlayTopY = barY + barH * (1 - ceiling);
+      const overlayBottomY = barY + barH * (1 - this.setpoint);
+      const overlayH = Math.max(1, overlayBottomY - overlayTopY);
+      ctx.fillStyle = hexToRgba(this.color, 0.33);
+      ctx.fillRect(barX, overlayTopY, barW, overlayH);
+      ctx.strokeStyle = this.color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(barX, overlayTopY);
+      ctx.lineTo(barX + barW, overlayTopY);
+      ctx.stroke();
+    }
+
+    // setpoint marker
+    const markerY = barY + barH * (1 - this.setpoint);
+    ctx.strokeStyle = COL_TEXT;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(barX - 4, markerY);
+    ctx.lineTo(barX + barW + 4, markerY);
+    ctx.stroke();
+
+    // Numeric readout
+    ctx.font = smallFont;
+    ctx.fillStyle = COL_SUBTEXT;
+    ctx.fillText(`${this.outputMw().toFixed(0).padStart(4, " ")} MW`, barX + barW + 14, barY + 4);
+    ctx.fillText(`cap ${this.capacityMw.toFixed(0)} MW`, barX + barW + 14, barY + 26);
+    ctx.fillText(`setpoint ${Math.round(this.setpoint * 100)}%`, barX + barW + 14, barY + 48);
+
+    if (!this.controllable) {
+      ctx.fillText(`ceiling ${Math.round(ceiling * 100)}%`, barX + barW + 14, barY + 70);
+      if (curtailed > 0.005) {
+        const curtMw = curtailed * this.capacityMw;
+        ctx.fillStyle = this.color;
+        ctx.fillText(`curtailed ${curtMw.toFixed(0)} MW`, barX + barW + 14, barY + 92);
+      }
+    }
+
+    // On/off button
+    const b = this.buttonRect;
+    roundRect(ctx, b.x, b.y, b.w, b.h, 6);
+    ctx.fillStyle = this.on ? COL_GOOD : COL_BAD;
+    ctx.fill();
+    ctx.fillStyle = "#0f1218";
+    ctx.font = smallFont;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(this.on ? "ON" : "OFF", b.x + b.w / 2, b.y + b.h / 2 + 1);
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+  }
+}
+
+class WindFarm extends Plant {
+  constructor(name, rect, color, capacityMw, controllable) {
+    super(name, rect, color, capacityMw, controllable, 1.2);
+  }
+  potentialCeiling(weather, hour) { return weather.windPotential(); }
+}
+
+class PVFarm extends Plant {
+  constructor(name, rect, color, capacityMw, controllable) {
+    super(name, rect, color, capacityMw, controllable, 1.5);
+  }
+  potentialCeiling(weather, hour) { return weather.solarPotential(hour); }
+}
+
+class GasPlant extends Plant {
+  constructor(name, rect, color, capacityMw, controllable) {
+    super(name, rect, color, capacityMw, controllable, 0.35); // slow
+  }
+  potentialCeiling(weather, hour) { return 1.0; }
+}
+
+// ---------------------------------------------------------------------------
+// Frequency gauge
+// ---------------------------------------------------------------------------
+
+class FrequencyGauge {
+  constructor(center, radius) {
+    this.center = center;
+    this.radius = radius;
+    this.frequency = NOMINAL_FREQ;
+  }
+
+  update(dt, supplyMw, demandMw) {
+    const mismatch = supplyMw - demandMw;
+    const targetFreq = NOMINAL_FREQ + (mismatch / 1000.0) * 5.0;
+    this.frequency = lerp(this.frequency, targetFreq, dt * FREQ_RESPONSIVENESS * 10);
+  }
+
+  draw(ctx, font, smallFont) {
+    const cx = this.center.x, cy = this.center.y, r = this.radius;
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 12, 0, Math.PI * 2);
+    ctx.fillStyle = COL_PANEL;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = COL_PANEL_BORDER;
+    ctx.stroke();
+
+    const minF = 45.0, maxF = 55.0;
+    const startAngle = 210 * Math.PI / 180;
+    const endAngle = -30 * Math.PI / 180;
+
+    const bands = [
+      [minF, FREQ_RED_LO, COL_BAD],
+      [FREQ_RED_LO, FREQ_GREEN_LO, COL_WARN],
+      [FREQ_GREEN_LO, FREQ_GREEN_HI, COL_GOOD],
+      [FREQ_GREEN_HI, FREQ_RED_HI, COL_WARN],
+      [FREQ_RED_HI, maxF, COL_BAD],
+    ];
+
+    const fToAngle = (f) => {
+      const t = clamp((f - minF) / (maxF - minF), 0, 1);
+      return startAngle + (endAngle - startAngle) * t;
+    };
+
+    for (const [lo, hi, color] of bands) {
+      const a0 = fToAngle(lo), a1 = fToAngle(hi);
+      const steps = 16;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      for (let i = 0; i <= steps; i++) {
+        const a = a0 + (a1 - a0) * (i / steps);
+        ctx.lineTo(cx + r * Math.cos(a), cy - r * Math.sin(a));
+      }
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 0.62, 0, Math.PI * 2);
+    ctx.fillStyle = COL_PANEL;
+    ctx.fill();
+
+    // needle
+    const needleAngle = fToAngle(this.frequency);
+    const nx = cx + (r * 0.8) * Math.cos(needleAngle);
+    const ny = cy - (r * 0.8) * Math.sin(needleAngle);
+    ctx.strokeStyle = COL_TEXT;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(nx, ny);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 6, 0, Math.PI * 2);
+    ctx.fillStyle = COL_TEXT;
+    ctx.fill();
+
+    ctx.font = font;
+    ctx.fillStyle = COL_TEXT;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`${this.frequency.toFixed(2)} Hz`, cx, cy + r + 34);
+
+    ctx.font = smallFont;
+    ctx.fillStyle = COL_SUBTEXT;
+    ctx.fillText("Grid frequency", cx, cy - r - 22);
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main game
+// ---------------------------------------------------------------------------
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+const FONT = "bold 20px Arial";
+const SMALL_FONT = "15px Arial";
+const BIG_FONT = "bold 30px Arial";
+
+const weather = createWeather();
+const dayClock = createClock();
+const demand = createDemand(150);
+
+let redTimer = 0.0;
+let flickerVisible = true;
+let flickerTimer = 0.0;
+let townOn = true;
+
+const panelW = 190, panelH = 300, panelY = 250;
+const wind = new WindFarm("Wind Farm", { x: 40, y: panelY, w: panelW, h: panelH }, COL_WIND, 150, false);
+const pv = new PVFarm("PV Farm", { x: 250, y: panelY, w: panelW, h: panelH }, COL_PV, 120, false);
+const gas = new GasPlant("Gas Plant", { x: 460, y: panelY, w: panelW, h: panelH }, COL_GAS, 220, true);
+const plants = [wind, pv, gas];
+
+const gauge = new FrequencyGauge({ x: 830, y: 400 }, 95);
+
+// --- input handling ---
+
+function getMousePos(evt) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return {
+    x: (evt.clientX - rect.left) * scaleX,
+    y: (evt.clientY - rect.top) * scaleY
+  };
+}
+
+canvas.addEventListener("wheel", (evt) => {
+  const pos = getMousePos(evt);
+  for (const plant of plants) {
+    if (plant.containsPoint(pos)) {
+      evt.preventDefault();
+      const direction = evt.deltaY < 0 ? 1 : -1;
+      plant.handleScroll(pos, direction);
+      break;
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener("click", (evt) => {
+  const pos = getMousePos(evt);
+  for (const plant of plants) {
+    if (plant.handleClick(pos)) break;
+  }
+});
+
+// --- update ---
+
+function update(dt) {
+  weather.update(dt);
+  dayClock.update(dt);
+  demand.update(dt);
+  for (const plant of plants) plant.update(dt, weather, dayClock.hour);
+
+  const supplyMw = plants.reduce((s, p) => s + p.outputMw(), 0);
+  const demandMw = demand.currentMw(dayClock.hour);
+  gauge.update(dt, supplyMw, demandMw);
+
+  // Blackout if frequency has sat in the red zone continuously for too long,
+  // or instantly if there's no supply at all.
+  const freq = gauge.frequency;
+  const inRedZone = freq <= FREQ_RED_LO || freq >= FREQ_RED_HI;
+  redTimer = inRedZone ? redTimer + dt : 0.0;
+
+  const blackoutFromFreq = redTimer >= RED_ZONE_BLACKOUT_SECONDS;
+  const blackoutFromNoSupply = supplyMw <= 0.5;
+  townOn = !(blackoutFromFreq || blackoutFromNoSupply);
+
+  // Flicker the town light whenever supply is short of demand
+  const balance = supplyMw - demandMw;
+  if (townOn && balance < 0) {
+    flickerTimer -= dt;
+    if (flickerTimer <= 0) {
+      flickerVisible = !flickerVisible;
+      flickerTimer = 0.12;
+    }
+  } else {
+    flickerVisible = true;
+    flickerTimer = 0.0;
+  }
+}
+
+// --- draw ---
+
+function drawHeader() {
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+
+  ctx.font = BIG_FONT;
+  ctx.fillStyle = COL_TEXT;
+  ctx.fillText("Energy Dispatch Dashboard", 40, 20);
+
+  const clockText = dayClock.displayText();
+  ctx.textAlign = "right";
+  ctx.fillText(clockText, SCREEN_W - 40, 20);
+  ctx.textAlign = "left";
+
+  const supplyMw = plants.reduce((s, p) => s + p.outputMw(), 0);
+  const demandMw = demand.currentMw(dayClock.hour);
+
+  ctx.font = FONT;
+  ctx.fillStyle = COL_TEXT;
+  ctx.fillText(`Demand: ${demandMw.toFixed(0).padStart(4, " ")} MW`, 40, 70);
+  ctx.fillText(`Supply: ${supplyMw.toFixed(0).padStart(4, " ")} MW`, 40, 96);
+
+  const balance = supplyMw - demandMw;
+  const balColor = Math.abs(balance) < 15 ? COL_GOOD : Math.abs(balance) < 40 ? COL_WARN : COL_BAD;
+  ctx.fillStyle = balColor;
+  const sign = balance >= 0 ? "+" : "";
+  ctx.fillText(`Balance: ${sign}${balance.toFixed(0)} MW`, 40, 122);
+
+  ctx.font = SMALL_FONT;
+  ctx.fillStyle = COL_SUBTEXT;
+  ctx.fillText(`Forecast: ${weather.forecastText()}`, 40, 170);
+}
+
+function drawTownLight() {
+  const cx = 700, cy = 90;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 40, 0, Math.PI * 2);
+  ctx.fillStyle = COL_PANEL;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = COL_PANEL_BORDER;
+  ctx.stroke();
+
+  let litColor, showLit;
+  if (!townOn) {
+    litColor = COL_BAD;
+    showLit = true;
+  } else {
+    litColor = COL_GOOD;
+    showLit = flickerVisible;
+  }
+  const bulbColor = showLit ? litColor : COL_OFF;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 26, 0, Math.PI * 2);
+  ctx.fillStyle = bulbColor;
+  ctx.fill();
+
+  ctx.font = SMALL_FONT;
+  ctx.fillStyle = COL_SUBTEXT;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("TOWN POWER", cx, cy + 55);
+
+  let status, statusColor;
+  if (!townOn) {
+    status = "BLACKOUT"; statusColor = COL_BAD;
+  } else if (flickerTimer || !flickerVisible) {
+    status = "LOW SUPPLY"; statusColor = COL_WARN;
+  } else {
+    status = "ON"; statusColor = COL_GOOD;
+  }
+  ctx.fillStyle = statusColor;
+  ctx.fillText(status, cx, cy + 74);
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+}
+
+function draw() {
+  ctx.fillStyle = "#12161e";
+  ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+
+  drawHeader();
+  drawTownLight();
+
+  for (const plant of plants) plant.draw(ctx, FONT, SMALL_FONT, weather, dayClock.hour);
+
+  gauge.draw(ctx, FONT, SMALL_FONT);
+
+  ctx.font = SMALL_FONT;
+  ctx.fillStyle = COL_SUBTEXT;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText("Scroll over a plant to adjust output - click ON/OFF to toggle", 40, SCREEN_H - 30);
+}
+
+// --- main loop ---
+
+let lastTime = performance.now();
+
+function frame(now) {
+  let dt = (now - lastTime) / 1000.0;
+  lastTime = now;
+  dt = clamp(dt, 0, 1 / 15); // avoid big jumps if the tab was backgrounded
+
+  update(dt);
+  draw();
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
